@@ -1,149 +1,149 @@
 defmodule TelemetryMetricsAppsignal do
+  @moduledoc """
+  AppSignal Reporter for [`Telemetry.Metrics`](https://github.com/beam-telemetry/telemetry_metrics) definitions.
+
+  Provide a list of metric definitions to the `init/2` function. It's recommended to
+  run TelemetryMetricsAppsignal under a supervision tree, either in your main application
+  or as recommended [here](https://hexdocs.pm/phoenix/telemetry.html#the-telemetry-supervisor).
+
+      def start_link(_arg) do
+        children = [
+          {TelemetryMetricsAppsignal, [metrics: metrics()]}
+        ...
+        ]
+        Supervisor.init(children, strategy: :one_for_one)
+      end
+
+      defp metrics, do:
+        [
+          summary("phoenix.endpoint.stop.duration"),
+          last_value("vm.memory.total"),
+          counter("my_app.my_server.call.exception")
+        ]
+
+
+  The following table shows how `Telemetry.Metrics` metrics map to AppSignal metrics:
+  | Telemetry.Metrics     | AppSignal |
+  |-----------------------|-----------|
+  | `last_value`          | [guage](https://docs.appsignal.com/metrics/custom.html#gauge) |
+  | `counter`             | [counter](https://docs.appsignal.com/metrics/custom.html#counter) |
+  | `sum`                 | [guage](https://docs.appsignal.com/metrics/custom.html#gauge) |
+  | `summary`             | [measurement](https://docs.appsignal.com/metrics/custom.html#measurement) |
+  | `distribution`        | Not supported |
+  """
+  use GenServer
   require Logger
 
   alias Telemetry.Metrics.Counter
-  alias Telemetry.Metrics.Distribution
   alias Telemetry.Metrics.LastValue
   alias Telemetry.Metrics.Sum
   alias Telemetry.Metrics.Summary
 
   @appsignal Application.compile_env(:telemetry_metrics_appsignal, :appsignal, Appsignal)
-  @handler_prefix "telemetry_metrics_appsignal"
 
   @type metric ::
           Counter.t()
-          | Distribution.t()
           | LastValue.t()
           | Sum.t()
           | Summary.t()
 
-  @type option :: {:namespace, String.t()}
+  @spec start_link([metric]) :: :ignore | {:error, any} | {:ok, pid}
+  def start_link(opts) do
+    server_opts = Keyword.take(opts, [:name])
 
-  @spec attach([metric], keyword(option)) :: no_return()
-  def attach(metrics, opts \\ []) do
-    namespace = Keyword.get(opts, :namespace)
-    handler_prefix = prepare_handler_prefix(namespace)
+    metrics =
+      opts[:metrics] ||
+        raise ArgumentError, "the :metrics option is required by #{inspect(__MODULE__)}"
 
-    metrics
-    |> Enum.group_by(& &1.event_name)
-    |> Enum.each(fn {event_name, metrics} ->
-      handler_id = Enum.join(handler_prefix ++ event_name, "_")
-
-      :telemetry.attach(handler_id, event_name, &handle_event/4, metrics: metrics)
-    end)
+    GenServer.start_link(__MODULE__, metrics, server_opts)
   end
 
-  @spec detach([metric], keyword(option)) :: no_return()
-  def detach(metrics, opts \\ []) do
-    namespace = Keyword.get(opts, :namespace)
-    handler_prefix = prepare_handler_prefix(namespace)
+  @impl true
+  @spec init([metric]) :: {:ok, [any]}
+  def init(metrics) do
+    Process.flag(:trap_exit, true)
+    groups = Enum.group_by(metrics, & &1.event_name)
 
-    metrics
-    |> Enum.map(& &1.event_name)
-    |> Enum.each(fn event_name ->
-      handler_id = Enum.join(handler_prefix ++ event_name, "_")
-      :telemetry.detach(handler_id)
-    end)
+    for {event, metrics} <- groups do
+      id = {__MODULE__, event, self()}
+      :telemetry.attach(id, event, &handle_event/4, metrics)
+    end
+
+    {:ok, Map.keys(groups)}
   end
 
-  defp handle_event(_event_name, measurements, metadata, config) do
-    metrics = Keyword.get(config, :metrics, [])
+  @impl true
+  def terminate(_, events) do
+    for event <- events do
+      :telemetry.detach({__MODULE__, event, self()})
+    end
 
-    Enum.each(metrics, fn metric ->
-      value = prepare_metric_value(metric.measurement, measurements)
-      tags = prepare_metric_tags(metric.tags, metadata)
-      send_metric(metric, value, tags)
-    end)
+    :ok
   end
 
-  defp prepare_handler_prefix(namespace) do
-    [@handler_prefix, namespace] |> Enum.reject(&is_nil/1)
+  defp handle_event(event_name, measurements, metadata, metrics) do
+    for metric <- metrics do
+      try do
+        if measurement = extract_measurement(metric, measurements) do
+          tags = extract_tags(metric, metadata)
+
+          event_name
+          |> Enum.join(".")
+          |> send_metric(metric, measurement, tags)
+        end
+      rescue
+        e ->
+          Logger.error("Could not format metric #{inspect(metric)}")
+          Logger.error(Exception.format(:error, e, __STACKTRACE__))
+      end
+    end
   end
 
-  defp prepare_metric_value(measurement, measurements)
-
-  defp prepare_metric_value(convert, measurements) when is_function(convert) do
-    convert.(measurements)
+  defp send_metric(event_name, _metric = %Counter{}, _measurement, tags) do
+    call_appsignal(:increment_counter, event_name, 1, tags)
   end
 
-  defp prepare_metric_value(measurement, measurements)
-       when is_map_key(measurements, measurement) do
-    measurements[measurement]
+  defp send_metric(event_name, _metric = %Summary{}, measurement, tags) do
+    call_appsignal(:add_distribution_value, event_name, measurement, tags)
   end
 
-  defp prepare_metric_value(_, _), do: nil
-
-  defp prepare_metric_tags(tags, metadata) do
-    Map.take(metadata, tags)
+  defp send_metric(event_name, _metric = %LastValue{}, measurement, tags) do
+    call_appsignal(:set_gauge, event_name, measurement, tags)
   end
 
-  defp send_metric(%Counter{} = metric, _value, tags) do
-    call_appsignal(:increment_counter, metric.name, 1, tags)
+  defp send_metric(event_name, _metric = %Sum{}, measurement, tags) do
+    call_appsignal(:increment_counter, event_name, measurement, tags)
   end
 
-  defp send_metric(%Summary{} = metric, value, tags) do
-    call_appsignal(
-      :add_distribution_value,
-      metric.name,
-      value,
-      tags
-    )
-  end
-
-  defp send_metric(%LastValue{} = metric, value, tags) do
-    call_appsignal(
-      :set_gauge,
-      metric.name,
-      value,
-      tags
-    )
-  end
-
-  defp send_metric(%Sum{} = metric, value, tags) do
-    call_appsignal(
-      :increment_counter,
-      metric.name,
-      value,
-      tags
-    )
-  end
-
-  defp send_metric(metric, _measurements, _tags) do
+  defp send_metric(_event_name, metric, _measurements, _tags) do
     Logger.warn("Ignoring unsupported metric #{inspect(metric)}")
   end
 
-  defp call_appsignal(function_name, key, value, tags) when is_list(key) do
-    call_appsignal(function_name, Enum.join(key, "."), value, tags)
+  defp call_appsignal(function_name, event_name, measurement, tags)
+       when is_binary(event_name) and is_number(measurement) and is_map(tags) do
+    apply(@appsignal, function_name, [event_name, measurement, tags])
   end
 
-  defp call_appsignal(function_name, key, value, tags)
-       when is_binary(key) and is_number(value) and is_map(tags) do
-    tags
-    |> tag_permutations()
-    |> Enum.each(fn tags_permutation ->
-      apply(@appsignal, function_name, [key, value, tags_permutation])
-    end)
-  end
-
-  defp call_appsignal(function_name, key, value, tags) do
+  defp call_appsignal(function_name, event_name, measurement, tags) do
     Logger.warn("""
     Attempted to send metrics invalid with AppSignal library: \
     #{inspect(function_name)}(\
-    #{inspect(key)}, \
-    #{inspect(value)}, \
+    #{inspect(event_name)}, \
+    #{inspect(measurement)}, \
     #{inspect(tags)}\
     )
     """)
   end
 
-  defp tag_permutations(map) when map == %{}, do: [%{}]
-
-  defp tag_permutations(tags) do
-    for {tag_name, tag_value} <- tags,
-        value_permutation <- [tag_value, "any"],
-        rest <- tag_permutations(Map.drop(tags, [tag_name])) do
-      Map.put(rest, tag_name, value_permutation)
+  defp extract_measurement(metric, measurements) do
+    case metric.measurement do
+      fun when is_function(fun, 1) -> fun.(measurements)
+      key -> measurements[key]
     end
-    |> Enum.uniq()
+  end
+
+  defp extract_tags(metric, metadata) do
+    tag_values = metric.tag_values.(metadata)
+    Map.take(tag_values, metric.tags)
   end
 end
